@@ -58,7 +58,7 @@ router.get("/:doctorId/slots", async (req, res) => {
     where: {
       doctorId,
       slotStart: { gte: dayStart, lte: dayEnd },
-      OR: [{ status: "BOOKED" }, { status: "HELD", holdExpiresAt: { gt: new Date() } }],
+      OR: [{ status: { in: ["BOOKED", "COMPLETED"] } }, { status: "HELD", holdExpiresAt: { gt: new Date() } }],
     },
     select: { slotStart: true },
   });

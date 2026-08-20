@@ -14,32 +14,15 @@ datasource db {
   url      = env("DATABASE_URL")
 }
 
-enum Role {
-  PATIENT
-  DOCTOR
-  ADMIN
-}
-
-enum AppointmentStatus {
-  HELD        // slot temporarily reserved while patient fills symptom form (expires)
-  BOOKED
-  CANCELLED
-  CANCELLED_BY_LEAVE
-  COMPLETED
-}
-
-enum Urgency {
-  LOW
-  MEDIUM
-  HIGH
-}
+// Note: SQLite does not support native enums, so fields use String with documented allowed values.
+// In Postgres, these can be mapped to native enums.
 
 model User {
   id           String   @id @default(uuid())
   name         String
   email        String   @unique
   passwordHash String
-  role         Role
+  role         String   // PATIENT | DOCTOR | ADMIN
   createdAt    DateTime @default(now())
 
   doctorProfile      DoctorProfile? @relation
@@ -86,13 +69,13 @@ model Appointment {
 
   slotStart   DateTime
   slotEnd     DateTime
-  status      AppointmentStatus @default(HELD)
+  status      String   @default("HELD") // HELD | BOOKED | CANCELLED | CANCELLED_BY_LEAVE | COMPLETED
   holdExpiresAt DateTime?       // only set while status = HELD
 
   // Pre-visit
   symptomText     String?
   preVisitSummary String?   // JSON: {urgency, chiefComplaint, questions:[...]}
-  urgency         Urgency?
+  urgency         String?   // LOW | MEDIUM | HIGH
 
   // Post-visit
   clinicalNotes    String?

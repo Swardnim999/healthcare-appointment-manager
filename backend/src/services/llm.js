@@ -4,7 +4,7 @@ const client = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
 
-const MODEL = process.env.ANTHROPIC_MODEL || "claude-sonnet-4-6";
+const MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
 
 /**
  * Calls Claude and requires strict JSON back. If the model, network, or key

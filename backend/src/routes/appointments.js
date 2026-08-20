@@ -38,16 +38,33 @@ router.post("/hold", requireAuth, requireRole("PATIENT"), async (req, res) => {
 
   try {
     const held = await prisma.$transaction(async (tx) => {
-      // Clean up this exact slot if a previous hold on it has expired —
-      // avoids piling up dead rows and lets it be re-held immediately.
-      await tx.appointment.deleteMany({
+      // Clean up this exact slot if it is stale (an expired hold or previously cancelled appointment),
+      // releasing the unique constraint on (doctorId, slotStart) so it can be re-held/booked.
+      const stale = await tx.appointment.findMany({
         where: {
           doctorId,
           slotStart: start,
-          status: "HELD",
-          holdExpiresAt: { lt: new Date() },
+          OR: [
+            { status: "HELD", holdExpiresAt: { lt: new Date() } },
+            { status: { in: ["CANCELLED", "CANCELLED_BY_LEAVE"] } },
+          ],
         },
+        select: { id: true },
       });
+
+      if (stale.length > 0) {
+        const staleIds = stale.map((s) => s.id);
+        await tx.emailLog.updateMany({
+          where: { appointmentId: { in: staleIds } },
+          data: { appointmentId: null },
+        });
+        await tx.medicationReminder.deleteMany({
+          where: { appointmentId: { in: staleIds } },
+        });
+        await tx.appointment.deleteMany({
+          where: { id: { in: staleIds } },
+        });
+      }
 
       return tx.appointment.create({
         data: {
