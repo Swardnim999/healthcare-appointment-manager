@@ -1,0 +1,290 @@
+import { Router } from "express";
+import { Prisma } from "@prisma/client";
+import prisma from "../utils/db.js";
+import { requireAuth, requireRole } from "../middleware/auth.js";
+import { generatePreVisitSummary, generatePostVisitSummary } from "../services/llm.js";
+import { sendEmail } from "../services/email.js";
+import { createCalendarEvent, updateCalendarEvent, deleteCalendarEvent } from "../services/calendar.js";
+
+const router = Router();
+const HOLD_TTL_MS = (Number(process.env.SLOT_HOLD_TTL_SECONDS) || 300) * 1000;
+
+/**
+ * STEP 1 — HOLD a slot.
+ *
+ * Double-booking prevention strategy:
+ *  - `slotStart` + `doctorId` has a DB-level UNIQUE constraint (see schema).
+ *  - We attempt to INSERT a row with status=HELD. If two patients race for
+ *    the same slot, the database itself rejects the second INSERT with a
+ *    unique-constraint violation (P2002) — this is atomic and correct even
+ *    under concurrent requests, unlike a "check-then-insert" pattern which
+ *    has a race window.
+ *  - The HELD row expires after SLOT_HOLD_TTL_SECONDS (default 5 min) via
+ *    `holdExpiresAt`. Expired holds are treated as free by the slots query
+ *    and get overwritten/cleaned up lazily (see /confirm and the sweep in
+ *    doctors.js's availability query, which filters out expired holds).
+ *  - This models a real "shopping cart hold" pattern: hold slot -> fill
+ *    symptom form -> confirm within the TTL, or the slot is released.
+ */
+router.post("/hold", requireAuth, requireRole("PATIENT"), async (req, res) => {
+  const { doctorId, slotStart } = req.body;
+  if (!doctorId || !slotStart) return res.status(400).json({ error: "doctorId and slotStart required" });
+
+  const doctor = await prisma.doctorProfile.findUnique({ where: { id: doctorId } });
+  if (!doctor) return res.status(404).json({ error: "Doctor not found" });
+
+  const start = new Date(slotStart);
+  const end = new Date(start.getTime() + doctor.slotDurationMin * 60 * 1000);
+
+  try {
+    const held = await prisma.$transaction(async (tx) => {
+      // Clean up this exact slot if a previous hold on it has expired —
+      // avoids piling up dead rows and lets it be re-held immediately.
+      await tx.appointment.deleteMany({
+        where: {
+          doctorId,
+          slotStart: start,
+          status: "HELD",
+          holdExpiresAt: { lt: new Date() },
+        },
+      });
+
+      return tx.appointment.create({
+        data: {
+          doctorId,
+          patientId: req.user.id,
+          slotStart: start,
+          slotEnd: end,
+          status: "HELD",
+          holdExpiresAt: new Date(Date.now() + HOLD_TTL_MS),
+        },
+      });
+    });
+
+    res.status(201).json({ appointmentId: held.id, holdExpiresAt: held.holdExpiresAt });
+  } catch (err) {
+    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002") {
+      return res.status(409).json({ error: "This slot was just taken by another patient. Please pick another slot." });
+    }
+    console.error(err);
+    res.status(500).json({ error: "Failed to hold slot" });
+  }
+});
+
+/**
+ * STEP 2 — CONFIRM booking with symptom form. Generates the AI pre-visit
+ * summary (never blocks booking if the LLM call fails), sends confirmation
+ * emails to patient + doctor, and creates calendar events for both.
+ */
+router.post("/:id/confirm", requireAuth, requireRole("PATIENT"), async (req, res) => {
+  const { id } = req.params;
+  const { symptomText } = req.body;
+
+  const appt = await prisma.appointment.findUnique({
+    where: { id },
+    include: { doctor: { include: { user: true } }, patient: true },
+  });
+  if (!appt || appt.patientId !== req.user.id) return res.status(404).json({ error: "Appointment not found" });
+  if (appt.status !== "HELD") return res.status(400).json({ error: "Appointment is not in a holdable state" });
+  if (appt.holdExpiresAt && appt.holdExpiresAt < new Date()) {
+    await prisma.appointment.delete({ where: { id } });
+    return res.status(410).json({ error: "Your slot hold expired. Please select a slot again." });
+  }
+
+  // LLM call — wrapped so failures never break the booking.
+  const aiSummary = await generatePreVisitSummary(symptomText || "No symptoms provided");
+
+  const updated = await prisma.appointment.update({
+    where: { id },
+    data: {
+      status: "BOOKED",
+      symptomText,
+      preVisitSummary: JSON.stringify(aiSummary),
+      urgency: (aiSummary.urgency || "MEDIUM").toUpperCase(),
+      holdExpiresAt: null,
+    },
+  });
+
+  // Fire-and-forget-ish side effects (awaited, but individually try/caught
+  // inside each service so one failing doesn't block the others).
+  const when = appt.slotStart.toLocaleString();
+  await sendEmail({
+    to: appt.patient.email,
+    subject: "Appointment Confirmed",
+    text: `Your appointment with Dr. ${appt.doctor.user.name} is confirmed for ${when}.`,
+    type: "BOOKING_CONFIRMATION",
+    appointmentId: id,
+  });
+  await sendEmail({
+    to: appt.doctor.user.email,
+    subject: "New Appointment Booked",
+    text: `New appointment with ${appt.patient.name} on ${when}. Urgency: ${aiSummary.urgency}. Chief complaint: ${aiSummary.chiefComplaint}`,
+    type: "BOOKING_CONFIRMATION",
+    appointmentId: id,
+  });
+
+  const patientEventId = await createCalendarEvent(appt.patientId, {
+    summary: `Appointment with Dr. ${appt.doctor.user.name}`,
+    description: `Clinic visit. Chief complaint: ${aiSummary.chiefComplaint || "N/A"}`,
+    start: appt.slotStart,
+    end: appt.slotEnd,
+  });
+  const doctorEventId = await createCalendarEvent(appt.doctor.userId, {
+    summary: `Patient: ${appt.patient.name}`,
+    description: `Urgency: ${aiSummary.urgency}. ${aiSummary.chiefComplaint || ""}`,
+    start: appt.slotStart,
+    end: appt.slotEnd,
+  });
+
+  await prisma.appointment.update({
+    where: { id },
+    data: { patientCalendarEventId: patientEventId, doctorCalendarEventId: doctorEventId },
+  });
+
+  res.json({ ...updated, preVisitSummary: aiSummary });
+});
+
+// Doctor's upcoming appointments with pre-visit AI summary
+router.get("/doctor/mine", requireAuth, requireRole("DOCTOR"), async (req, res) => {
+  const doctorProfile = await prisma.doctorProfile.findUnique({ where: { userId: req.user.id } });
+  if (!doctorProfile) return res.status(404).json({ error: "Doctor profile not found" });
+
+  const appts = await prisma.appointment.findMany({
+    where: { doctorId: doctorProfile.id, status: { in: ["BOOKED", "COMPLETED"] } },
+    include: { patient: { select: { name: true, email: true } } },
+    orderBy: { slotStart: "asc" },
+  });
+  res.json(appts.map((a) => ({ ...a, preVisitSummary: safeParse(a.preVisitSummary) })));
+});
+
+// Patient's own appointments
+router.get("/patient/mine", requireAuth, requireRole("PATIENT"), async (req, res) => {
+  const appts = await prisma.appointment.findMany({
+    where: { patientId: req.user.id, status: { in: ["BOOKED", "COMPLETED"] } },
+    include: { doctor: { include: { user: { select: { name: true } } } } },
+    orderBy: { slotStart: "asc" },
+  });
+  res.json(appts.map((a) => ({ ...a, postVisitSummary: safeParse(a.postVisitSummary) })));
+});
+
+/**
+ * Doctor submits post-visit notes + prescription -> LLM generates a
+ * patient-friendly summary -> medication reminders are scheduled based on
+ * prescription frequency.
+ */
+router.post("/:id/complete", requireAuth, requireRole("DOCTOR"), async (req, res) => {
+  const { id } = req.params;
+  const { clinicalNotes, prescription } = req.body; // prescription: [{drug, dose, frequency, days}]
+
+  const appt = await prisma.appointment.findUnique({
+    where: { id },
+    include: { doctor: true, patient: true },
+  });
+  if (!appt) return res.status(404).json({ error: "Appointment not found" });
+  const doctorProfile = await prisma.doctorProfile.findUnique({ where: { userId: req.user.id } });
+  if (!doctorProfile || appt.doctorId !== doctorProfile.id) return res.status(403).json({ error: "Not your appointment" });
+
+  const aiSummary = await generatePostVisitSummary(clinicalNotes, prescription);
+
+  await prisma.appointment.update({
+    where: { id },
+    data: {
+      status: "COMPLETED",
+      clinicalNotes,
+      prescription: JSON.stringify(prescription || []),
+      postVisitSummary: JSON.stringify(aiSummary),
+    },
+  });
+
+  // Schedule medication reminders. frequency examples: "twice daily", "once daily", "every 8 hours"
+  const reminders = [];
+  for (const med of prescription || []) {
+    const timesPerDay = parseFrequencyToTimesPerDay(med.frequency);
+    const days = Number(med.days) || 1;
+    for (let d = 0; d < days; d++) {
+      for (let t = 0; t < timesPerDay; t++) {
+        const scheduledAt = new Date();
+        scheduledAt.setDate(scheduledAt.getDate() + d);
+        scheduledAt.setHours(9 + Math.floor((t * 24) / timesPerDay), 0, 0, 0);
+        reminders.push({
+          appointmentId: id,
+          drugName: med.drug,
+          dose: med.dose,
+          scheduledAt,
+        });
+      }
+    }
+  }
+  if (reminders.length) {
+    await prisma.medicationReminder.createMany({ data: reminders });
+  }
+
+  await sendEmail({
+    to: appt.patient.email,
+    subject: "Your Visit Summary Is Ready",
+    text: `Your visit summary: ${aiSummary.summary}`,
+    type: "BOOKING_CONFIRMATION",
+    appointmentId: id,
+  });
+
+  res.json({ postVisitSummary: aiSummary, reminderCount: reminders.length });
+});
+
+// Cancel / reschedule
+router.post("/:id/cancel", requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const appt = await prisma.appointment.findUnique({
+    where: { id },
+    include: { doctor: { include: { user: true } }, patient: true },
+  });
+  if (!appt) return res.status(404).json({ error: "Appointment not found" });
+
+  const isOwnerPatient = req.user.role === "PATIENT" && appt.patientId === req.user.id;
+  const doctorProfile = req.user.role === "DOCTOR" ? await prisma.doctorProfile.findUnique({ where: { userId: req.user.id } }) : null;
+  const isOwnerDoctor = doctorProfile && appt.doctorId === doctorProfile.id;
+  if (!isOwnerPatient && !isOwnerDoctor && req.user.role !== "ADMIN") {
+    return res.status(403).json({ error: "Not authorized to cancel this appointment" });
+  }
+
+  await prisma.appointment.update({ where: { id }, data: { status: "CANCELLED" } });
+
+  await deleteCalendarEvent(appt.patientId, appt.patientCalendarEventId);
+  await deleteCalendarEvent(appt.doctor.userId, appt.doctorCalendarEventId);
+
+  await sendEmail({
+    to: appt.patient.email,
+    subject: "Appointment Cancelled",
+    text: `Your appointment on ${appt.slotStart.toLocaleString()} has been cancelled.`,
+    type: "CANCELLATION",
+    appointmentId: id,
+  });
+  await sendEmail({
+    to: appt.doctor.user.email,
+    subject: "Appointment Cancelled",
+    text: `Appointment with ${appt.patient.name} on ${appt.slotStart.toLocaleString()} has been cancelled.`,
+    type: "CANCELLATION",
+    appointmentId: id,
+  });
+
+  res.json({ status: "CANCELLED" });
+});
+
+function safeParse(json) {
+  try {
+    return json ? JSON.parse(json) : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseFrequencyToTimesPerDay(freq = "") {
+  const f = freq.toLowerCase();
+  if (f.includes("once")) return 1;
+  if (f.includes("twice")) return 2;
+  if (f.includes("thrice") || f.includes("three")) return 3;
+  const everyHoursMatch = f.match(/every (\d+) hours?/);
+  if (everyHoursMatch) return Math.max(1, Math.floor(24 / Number(everyHoursMatch[1])));
+  return 1;
+}
+
+export default router;

@@ -1,0 +1,145 @@
+// ---------------------------------------------------------------------------
+// Healthcare Appointment & Follow-up Manager — Database Schema
+// SQLite by default (zero-config for grading). To use Postgres in prod:
+//   1. set provider = "postgresql" below
+//   2. set DATABASE_URL="postgresql://..." in .env
+// ---------------------------------------------------------------------------
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  PATIENT
+  DOCTOR
+  ADMIN
+}
+
+enum AppointmentStatus {
+  HELD        // slot temporarily reserved while patient fills symptom form (expires)
+  BOOKED
+  CANCELLED
+  CANCELLED_BY_LEAVE
+  COMPLETED
+}
+
+enum Urgency {
+  LOW
+  MEDIUM
+  HIGH
+}
+
+model User {
+  id           String   @id @default(uuid())
+  name         String
+  email        String   @unique
+  passwordHash String
+  role         Role
+  createdAt    DateTime @default(now())
+
+  doctorProfile      DoctorProfile? @relation
+  patientAppointments Appointment[] @relation("PatientAppointments")
+  googleTokens       GoogleToken?
+}
+
+model DoctorProfile {
+  id             String   @id @default(uuid())
+  userId         String   @unique
+  user           User     @relation(fields: [userId], references: [id])
+  specialization String
+  slotDurationMin Int     @default(30)
+  workingHours   String   // JSON string: {"mon":["09:00","17:00"], ...}
+  createdAt      DateTime @default(now())
+
+  leaves       DoctorLeave[]
+  appointments Appointment[] @relation("DoctorAppointments")
+}
+
+model DoctorLeave {
+  id        String   @id @default(uuid())
+  doctorId  String
+  doctor    DoctorProfile @relation(fields: [doctorId], references: [id])
+  date      String   // YYYY-MM-DD
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([doctorId, date])
+}
+
+// Represents a bookable slot. A slot is either HELD (temp lock while patient
+// fills the form) or BOOKED. The unique constraint on (doctorId, slotStart)
+// is what actually prevents double-booking at the DB level — two concurrent
+// requests racing for the same slot will have one fail on unique violation.
+model Appointment {
+  id          String   @id @default(uuid())
+
+  doctorId    String
+  doctor      DoctorProfile @relation("DoctorAppointments", fields: [doctorId], references: [id])
+
+  patientId   String
+  patient     User     @relation("PatientAppointments", fields: [patientId], references: [id])
+
+  slotStart   DateTime
+  slotEnd     DateTime
+  status      AppointmentStatus @default(HELD)
+  holdExpiresAt DateTime?       // only set while status = HELD
+
+  // Pre-visit
+  symptomText     String?
+  preVisitSummary String?   // JSON: {urgency, chiefComplaint, questions:[...]}
+  urgency         Urgency?
+
+  // Post-visit
+  clinicalNotes    String?
+  prescription     String?   // JSON: [{drug, dose, frequency, days}]
+  postVisitSummary String?
+
+  // Calendar
+  patientCalendarEventId String?
+  doctorCalendarEventId  String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  medicationReminders MedicationReminder[]
+  emailLogs           EmailLog[]
+
+  @@unique([doctorId, slotStart])
+}
+
+model MedicationReminder {
+  id            String   @id @default(uuid())
+  appointmentId String
+  appointment   Appointment @relation(fields: [appointmentId], references: [id])
+  drugName      String
+  dose          String
+  scheduledAt   DateTime
+  sent          Boolean  @default(false)
+  createdAt     DateTime @default(now())
+}
+
+model EmailLog {
+  id            String   @id @default(uuid())
+  appointmentId String?
+  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
+  toEmail       String
+  type          String   // BOOKING_CONFIRMATION | REMINDER | CANCELLATION | LEAVE_CANCELLATION
+  status        String   // SENT | FAILED | RETRYING
+  attempts      Int      @default(0)
+  lastError     String?
+  createdAt     DateTime @default(now())
+}
+
+model GoogleToken {
+  id           String   @id @default(uuid())
+  userId       String   @unique
+  user         User     @relation(fields: [userId], references: [id])
+  accessToken  String
+  refreshToken String
+  expiryDate   DateTime
+}
