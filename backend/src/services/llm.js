@@ -6,13 +6,22 @@ const client = process.env.ANTHROPIC_API_KEY
 
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
 
+export function normalizeUrgency(urgency) {
+  if (typeof urgency !== "string") return "MEDIUM";
+  const normalized = urgency.trim().toUpperCase();
+  if (["LOW", "MEDIUM", "HIGH"].includes(normalized)) {
+    return normalized;
+  }
+  return "MEDIUM";
+}
+
 /**
  * Calls Claude and requires strict JSON back. If the model, network, or key
  * fails for any reason, we NEVER throw up to the route handler — booking
  * flows must not break because the LLM is down. Instead we return a safe
  * fallback object and mark it so the UI/DB can flag "AI summary unavailable".
  */
-async function callClaudeJSON(systemPrompt, userPrompt, fallback) {
+export async function callClaudeJSON(systemPrompt, userPrompt, fallback) {
   if (!client) {
     console.warn("[llm] ANTHROPIC_API_KEY not set — returning fallback summary");
     return { ...fallback, _aiFailed: true };
@@ -32,8 +41,12 @@ async function callClaudeJSON(systemPrompt, userPrompt, fallback) {
       .trim();
 
     // Strip markdown code fences if present
-    const cleaned = text.replace(/^```json\s*/i, "").replace(/```\s*$/i, "").trim();
-    return { ...JSON.parse(cleaned), _aiFailed: false };
+    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/```\s*$/i, "").trim();
+    const parsed = JSON.parse(cleaned);
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+      return { ...fallback, _aiFailed: true };
+    }
+    return { ...parsed, _aiFailed: false };
   } catch (err) {
     console.error("[llm] Claude call failed:", err.message);
     return { ...fallback, _aiFailed: true };
@@ -47,13 +60,13 @@ async function callClaudeJSON(systemPrompt, userPrompt, fallback) {
 export async function generatePreVisitSummary(symptomText) {
   const systemPrompt = `You are a clinical intake assistant. You NEVER diagnose.
 Respond with ONLY valid JSON, no prose, no markdown fences, matching exactly this shape:
-{"urgency": "Low" | "Medium" | "High", "chiefComplaint": string, "suggestedQuestions": [string, string, string]}`;
+{"urgency": "LOW" | "MEDIUM" | "HIGH", "chiefComplaint": string, "suggestedQuestions": [string, string, string]}`;
 
-  const userPrompt = `Analyse these symptoms and return: urgency level (Low / Medium / High), chief complaint, and three suggested questions for the doctor. Symptoms: ${symptomText}`;
+  const userPrompt = `Analyse these symptoms and return: urgency level (LOW / MEDIUM / HIGH), chief complaint, and three suggested questions for the doctor. Symptoms: ${symptomText}`;
 
   const fallback = {
-    urgency: "Medium",
-    chiefComplaint: symptomText.slice(0, 140),
+    urgency: "MEDIUM",
+    chiefComplaint: typeof symptomText === "string" ? symptomText.slice(0, 140) : "Symptoms provided",
     suggestedQuestions: [
       "Could you describe when the symptoms started?",
       "Have you noticed anything that makes it better or worse?",
@@ -61,7 +74,18 @@ Respond with ONLY valid JSON, no prose, no markdown fences, matching exactly thi
     ],
   };
 
-  return callClaudeJSON(systemPrompt, userPrompt, fallback);
+  const result = await callClaudeJSON(systemPrompt, userPrompt, fallback);
+
+  // Validate and normalize urgency
+  result.urgency = normalizeUrgency(result.urgency);
+  if (!result.chiefComplaint || typeof result.chiefComplaint !== "string") {
+    result.chiefComplaint = fallback.chiefComplaint;
+  }
+  if (!Array.isArray(result.suggestedQuestions) || result.suggestedQuestions.length === 0) {
+    result.suggestedQuestions = fallback.suggestedQuestions;
+  }
+
+  return result;
 }
 
 /**

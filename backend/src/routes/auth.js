@@ -6,19 +6,18 @@ import prisma from "../utils/db.js";
 const router = Router();
 
 router.post("/register", async (req, res) => {
-  const { name, email, password, role } = req.body;
+  const { name, email, password } = req.body;
   if (!name || !email || !password) {
     return res.status(400).json({ error: "name, email, password are required" });
   }
-  const allowedRoles = ["PATIENT", "DOCTOR"]; // ADMIN accounts are seeded, not self-registered
-  const finalRole = allowedRoles.includes(role) ? role : "PATIENT";
 
   const existing = await prisma.user.findUnique({ where: { email } });
   if (existing) return res.status(409).json({ error: "Email already registered" });
 
   const passwordHash = await bcrypt.hash(password, 10);
+  // Public self-registration ALWAYS creates PATIENT accounts. Privileged accounts (DOCTOR, ADMIN) cannot be self-registered.
   const user = await prisma.user.create({
-    data: { name, email, passwordHash, role: finalRole },
+    data: { name, email, passwordHash, role: "PATIENT" },
   });
 
   const token = signToken(user);

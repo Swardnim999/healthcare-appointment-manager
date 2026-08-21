@@ -111,6 +111,8 @@ model EmailLog {
   appointmentId String?
   appointment   Appointment? @relation(fields: [appointmentId], references: [id])
   toEmail       String
+  subject       String?
+  body          String?
   type          String   // BOOKING_CONFIRMATION | REMINDER | CANCELLATION | LEAVE_CANCELLATION
   status        String   // SENT | FAILED | RETRYING
   attempts      Int      @default(0)

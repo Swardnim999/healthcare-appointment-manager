@@ -2,7 +2,7 @@ import { Router } from "express";
 import { Prisma } from "@prisma/client";
 import prisma from "../utils/db.js";
 import { requireAuth, requireRole } from "../middleware/auth.js";
-import { generatePreVisitSummary, generatePostVisitSummary } from "../services/llm.js";
+import { generatePreVisitSummary, generatePostVisitSummary, normalizeUrgency } from "../services/llm.js";
 import { sendEmail } from "../services/email.js";
 import { createCalendarEvent, updateCalendarEvent, deleteCalendarEvent } from "../services/calendar.js";
 
@@ -35,6 +35,19 @@ router.post("/hold", requireAuth, requireRole("PATIENT"), async (req, res) => {
 
   const start = new Date(slotStart);
   const end = new Date(start.getTime() + doctor.slotDurationMin * 60 * 1000);
+
+  // Check if doctor is on leave on this date
+  const isoDate = start.toISOString().slice(0, 10);
+  const localDate = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, "0")}-${String(start.getDate()).padStart(2, "0")}`;
+  const onLeave = await prisma.doctorLeave.findFirst({
+    where: {
+      doctorId,
+      OR: [{ date: isoDate }, { date: localDate }],
+    },
+  });
+  if (onLeave) {
+    return res.status(409).json({ error: "Doctor is on leave on this date" });
+  }
 
   try {
     const held = await prisma.$transaction(async (tx) => {
@@ -108,6 +121,23 @@ router.post("/:id/confirm", requireAuth, requireRole("PATIENT"), async (req, res
     return res.status(410).json({ error: "Your slot hold expired. Please select a slot again." });
   }
 
+  // Re-check doctor leave before confirming
+  const apptIsoDate = appt.slotStart.toISOString().slice(0, 10);
+  const apptLocalDate = `${appt.slotStart.getFullYear()}-${String(appt.slotStart.getMonth() + 1).padStart(2, "0")}-${String(appt.slotStart.getDate()).padStart(2, "0")}`;
+  const doctorOnLeave = await prisma.doctorLeave.findFirst({
+    where: {
+      doctorId: appt.doctorId,
+      OR: [{ date: apptIsoDate }, { date: apptLocalDate }],
+    },
+  });
+  if (doctorOnLeave) {
+    await prisma.appointment.update({
+      where: { id },
+      data: { status: "CANCELLED_BY_LEAVE", holdExpiresAt: null },
+    });
+    return res.status(409).json({ error: "Doctor is on leave on this date. Please select another slot." });
+  }
+
   // LLM call — wrapped so failures never break the booking.
   const aiSummary = await generatePreVisitSummary(symptomText || "No symptoms provided");
 
@@ -117,7 +147,7 @@ router.post("/:id/confirm", requireAuth, requireRole("PATIENT"), async (req, res
       status: "BOOKED",
       symptomText,
       preVisitSummary: JSON.stringify(aiSummary),
-      urgency: (aiSummary.urgency || "MEDIUM").toUpperCase(),
+      urgency: normalizeUrgency(aiSummary.urgency),
       holdExpiresAt: null,
     },
   });
@@ -213,16 +243,17 @@ router.post("/:id/complete", requireAuth, requireRole("DOCTOR"), async (req, res
     },
   });
 
-  // Schedule medication reminders. frequency examples: "twice daily", "once daily", "every 8 hours"
+  // Schedule medication reminders distributed reasonably across waking hours (08:00 -> 22:00)
   const reminders = [];
   for (const med of prescription || []) {
     const timesPerDay = parseFrequencyToTimesPerDay(med.frequency);
+    const doseHours = calculateDailyDoseHours(timesPerDay);
     const days = Number(med.days) || 1;
     for (let d = 0; d < days; d++) {
-      for (let t = 0; t < timesPerDay; t++) {
+      for (const hour of doseHours) {
         const scheduledAt = new Date();
         scheduledAt.setDate(scheduledAt.getDate() + d);
-        scheduledAt.setHours(9 + Math.floor((t * 24) / timesPerDay), 0, 0, 0);
+        scheduledAt.setHours(hour, 0, 0, 0);
         reminders.push({
           appointmentId: id,
           drugName: med.drug,
@@ -294,14 +325,48 @@ function safeParse(json) {
   }
 }
 
-function parseFrequencyToTimesPerDay(freq = "") {
-  const f = freq.toLowerCase();
-  if (f.includes("once")) return 1;
-  if (f.includes("twice")) return 2;
-  if (f.includes("thrice") || f.includes("three")) return 3;
-  const everyHoursMatch = f.match(/every (\d+) hours?/);
-  if (everyHoursMatch) return Math.max(1, Math.floor(24 / Number(everyHoursMatch[1])));
+export function parseFrequencyToTimesPerDay(freq = "") {
+  if (typeof freq !== "string") return 1;
+  const f = freq.toLowerCase().trim();
+  if (f.includes("four") || f.includes("4 times") || f.includes("4x") || f.includes("qid")) return 4;
+  if (f.includes("three") || f.includes("thrice") || f.includes("3 times") || f.includes("3x") || f.includes("tid")) return 3;
+  if (f.includes("twice") || f.includes("2 times") || f.includes("2x") || f.includes("bid")) return 2;
+  if (f.includes("once") || f.includes("1 time") || f.includes("1x") || f.includes("qd") || f.includes("daily")) return 1;
+
+  const everyHoursMatch = f.match(/every\s+(\d+)\s*hours?/);
+  if (everyHoursMatch) {
+    const hours = Number(everyHoursMatch[1]);
+    if (hours > 0) return Math.max(1, Math.min(24, Math.floor(24 / hours)));
+  }
+  const timesMatch = f.match(/(\d+)\s*(?:times|x)\s*(?:a|per|\/)?\s*day/);
+  if (timesMatch) {
+    return Math.max(1, Math.min(24, Number(timesMatch[1])));
+  }
   return 1;
+}
+
+export function calculateDailyDoseHours(timesPerDay) {
+  switch (timesPerDay) {
+    case 1:
+      return [9]; // 09:00 morning dose
+    case 2:
+      return [8, 20]; // 08:00, 20:00 (12h interval, awake)
+    case 3:
+      return [8, 14, 20]; // 08:00, 14:00, 20:00 (6h interval, awake)
+    case 4:
+      return [8, 12, 16, 20]; // 08:00, 12:00, 16:00, 20:00 (4h interval, awake)
+    default: {
+      if (timesPerDay <= 0) return [9];
+      const startHour = 8;
+      const endHour = 22;
+      const step = (endHour - startHour) / (timesPerDay - 1);
+      const hours = [];
+      for (let i = 0; i < timesPerDay; i++) {
+        hours.push(Math.round(startHour + i * step));
+      }
+      return hours;
+    }
+  }
 }
 
 export default router;

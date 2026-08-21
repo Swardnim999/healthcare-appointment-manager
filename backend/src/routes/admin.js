@@ -68,10 +68,16 @@ router.post("/doctors/:id/leave", async (req, res) => {
     create: { doctorId, date, reason },
   });
 
-  const dayStart = new Date(date + "T00:00:00");
-  const dayEnd = new Date(date + "T23:59:59");
+  const dayStartLocal = new Date(date + "T00:00:00");
+  const dayEndLocal = new Date(date + "T23:59:59.999");
+  const dayStartUtc = new Date(date + "T00:00:00.000Z");
+  const dayEndUtc = new Date(date + "T23:59:59.999Z");
+  const minStart = dayStartLocal < dayStartUtc ? dayStartLocal : dayStartUtc;
+  const maxEnd = dayEndLocal > dayEndUtc ? dayEndLocal : dayEndUtc;
+
+  // Cancel existing BOOKED appointments on that date and notify patients
   const affected = await prisma.appointment.findMany({
-    where: { doctorId, status: "BOOKED", slotStart: { gte: dayStart, lte: dayEnd } },
+    where: { doctorId, status: "BOOKED", slotStart: { gte: minStart, lte: maxEnd } },
     include: { patient: true },
   });
 
@@ -88,7 +94,18 @@ router.post("/doctors/:id/leave", async (req, res) => {
     });
   }
 
-  res.json({ leaveMarked: true, affectedAppointments: affected.length });
+  // Invalidate any active HELD appointments on that date
+  const held = await prisma.appointment.findMany({
+    where: { doctorId, status: "HELD", slotStart: { gte: minStart, lte: maxEnd } },
+  });
+  for (const h of held) {
+    await prisma.appointment.update({
+      where: { id: h.id },
+      data: { status: "CANCELLED_BY_LEAVE", holdExpiresAt: null },
+    });
+  }
+
+  res.json({ leaveMarked: true, affectedAppointments: affected.length, invalidatedHolds: held.length });
 });
 
 router.get("/analytics", async (req, res) => {
