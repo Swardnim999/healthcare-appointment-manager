@@ -1,8 +1,19 @@
 import { useEffect, useState } from "react";
-import { Link } from "react-router-dom";
-import { api } from "../../api";
+import { api, getUser } from "../../api";
+import Header from "../../components/Header.jsx";
+import MobileBottomNav from "../../components/MobileBottomNav.jsx";
+import UpcomingAppointmentCard from "../../components/UpcomingAppointmentCard.jsx";
+import AiPreVisitSummaryCard from "../../components/AiPreVisitSummaryCard.jsx";
+import RecentAppointmentsList from "../../components/RecentAppointmentsList.jsx";
+import QuickActionsCard from "../../components/QuickActionsCard.jsx";
+import MedicationsCard from "../../components/MedicationsCard.jsx";
+import RescheduleModal from "../../components/RescheduleModal.jsx";
+import CancelAppointmentModal from "../../components/CancelAppointmentModal.jsx";
 
 export default function PatientDashboard() {
+  const user = getUser();
+  const patientName = user?.name ? user.name.split(" ")[0] : "there";
+
   const [appointments, setAppointments] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -18,17 +29,25 @@ export default function PatientDashboard() {
   const [rescheduling, setRescheduling] = useState(false);
   const [rescheduleSuccess, setRescheduleSuccess] = useState("");
 
+  // Cancel modal state
+  const [cancellingAppt, setCancellingAppt] = useState(null);
+  const [cancelling, setCancelling] = useState(false);
+  const [cancelError, setCancelError] = useState("");
+
   function loadAppointments() {
     setLoading(true);
+    setError("");
     api("/appointments/patient/mine")
-      .then(setAppointments)
+      .then((data) => {
+        setAppointments(Array.isArray(data) ? data : []);
+      })
       .catch((e) => setError(e.message))
       .finally(() => setLoading(false));
   }
 
   function checkCalendarStatus() {
     api("/calendar/status")
-      .then((data) => setCalendarConnected(data.connected))
+      .then((data) => setCalendarConnected(Boolean(data.connected)))
       .catch(() => setCalendarConnected(false));
   }
 
@@ -48,13 +67,23 @@ export default function PatientDashboard() {
     }
   }
 
-  async function cancel(id) {
-    if (!confirm("Cancel this appointment?")) return;
+  function startCancel(appt) {
+    setCancellingAppt(appt);
+    setCancelError("");
+  }
+
+  async function confirmCancel() {
+    if (!cancellingAppt) return;
+    setCancelling(true);
+    setCancelError("");
     try {
-      await api(`/appointments/${id}/cancel`, { method: "POST" });
-      setAppointments((prev) => prev.filter((a) => a.id !== id));
+      await api(`/appointments/${cancellingAppt.id}/cancel`, { method: "POST" });
+      setAppointments((prev) => prev.filter((a) => a.id !== cancellingAppt.id));
+      setCancellingAppt(null);
     } catch (err) {
-      setError(err.message);
+      setCancelError(err.message || "Failed to cancel appointment");
+    } finally {
+      setCancelling(false);
     }
   }
 
@@ -113,170 +142,126 @@ export default function PatientDashboard() {
     }
   }
 
+  // Segment appointments into upcoming and past/recent
+  const bookedAppointments = appointments.filter((a) => a.status === "BOOKED");
+  // Upcoming is the next booked appointment
+  const upcomingAppointment = bookedAppointments.length > 0 ? bookedAppointments[0] : null;
+
+  // Recent appointments are completed appointments and any other past visits
+  const recentAppointments = appointments
+    .filter((a) => a.id !== upcomingAppointment?.id)
+    .sort((a, b) => new Date(b.slotStart).getTime() - new Date(a.slotStart).getTime());
+
   return (
-    <div className="max-w-3xl mx-auto p-6">
-      <div className="flex flex-wrap justify-between items-center gap-4 mb-6">
-        <div>
-          <h1 className="text-2xl font-bold text-brand-700">My Appointments</h1>
-          <div className="mt-1">
-            {calendarConnected ? (
-              <span className="inline-flex items-center gap-1 text-xs bg-green-100 text-green-700 px-2 py-0.5 rounded font-medium">
-                ✓ Google Calendar Connected
-              </span>
-            ) : (
-              <button
-                onClick={connectCalendar}
-                className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-2.5 py-1 rounded font-medium border border-slate-300 transition"
-              >
-                📅 Connect Google Calendar
-              </button>
-            )}
+    <div className="min-h-screen bg-background text-on-surface antialiased flex flex-col font-sans">
+      {/* Vitalis Patient Navigation Header */}
+      <Header
+        user={user}
+        calendarConnected={calendarConnected}
+        onConnectCalendar={connectCalendar}
+        activeTab="dashboard"
+      />
+
+      {/* Main Content Area */}
+      <main className="flex-1 max-w-[1440px] w-full mx-auto px-4 sm:px-6 lg:px-10 pt-6 sm:pt-8 pb-24 md:pb-12">
+        {/* Welcome / Hero Banner */}
+        <header className="mb-8">
+          <h1 className="font-manrope font-bold text-2xl sm:text-3xl lg:text-4xl text-on-surface tracking-tight">
+            Welcome back, {patientName}.
+          </h1>
+          <p className="font-sans text-sm sm:text-base text-on-surface-variant mt-1.5">
+            Here is your health overview for today.
+          </p>
+        </header>
+
+        {/* Global Error Banner if any */}
+        {error && (
+          <div className="mb-6 p-4 bg-error-container text-error rounded-2xl border border-error/30 text-sm flex items-center justify-between">
+            <div className="flex items-center gap-2">
+              <span className="material-symbols-outlined text-[20px]">error</span>
+              <span>{error}</span>
+            </div>
+            <button
+              onClick={() => setError("")}
+              className="text-xs uppercase font-bold tracking-wider hover:underline"
+            >
+              Dismiss
+            </button>
+          </div>
+        )}
+
+        {/* Two-Column Responsive Grid */}
+        <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 lg:gap-8 items-start">
+          {/* Left Column (Main Clinical Data & History: 8 columns) */}
+          <div className="lg:col-span-8 flex flex-col gap-6">
+            {/* Upcoming Appointment Card */}
+            <UpcomingAppointmentCard
+              appointment={upcomingAppointment}
+              onReschedule={startReschedule}
+              onCancel={startCancel}
+              loading={loading}
+            />
+
+            {/* AI Pre-Visit Summary Card */}
+            <AiPreVisitSummaryCard
+              appointment={upcomingAppointment}
+              loading={loading}
+            />
+
+            {/* Recent Appointments History */}
+            <RecentAppointmentsList
+              appointments={recentAppointments}
+              loading={loading}
+            />
+          </div>
+
+          {/* Right Column (Quick Actions & Medications: 4 columns) */}
+          <div className="lg:col-span-4 flex flex-col gap-6">
+            {/* Quick Actions Card */}
+            <QuickActionsCard />
+
+            {/* Medications Card */}
+            <MedicationsCard
+              appointments={appointments}
+              loading={loading}
+            />
           </div>
         </div>
-        <Link to="/patient/book" className="bg-brand-600 hover:bg-brand-700 text-white rounded px-4 py-2 text-sm font-medium">
-          + Book Appointment
-        </Link>
-      </div>
+      </main>
 
-      {loading && <p>Loading...</p>}
-      {error && <p className="text-red-600 mb-4">{error}</p>}
-
-      <div className="space-y-4">
-        {appointments.length === 0 && !loading && (
-          <p className="text-slate-500">No appointments yet. Book one to get started.</p>
-        )}
-        {appointments.map((a) => (
-          <div key={a.id} className="bg-white rounded-xl shadow p-5">
-            <div className="flex justify-between items-start">
-              <div>
-                <p className="font-semibold">Dr. {a.doctor.user.name}</p>
-                <p className="text-sm text-slate-500">{new Date(a.slotStart).toLocaleString()}</p>
-                <span className={`inline-block mt-2 text-xs px-2 py-1 rounded font-medium ${
-                  a.status === "COMPLETED" ? "bg-green-100 text-green-700" : "bg-blue-100 text-blue-700"
-                }`}>
-                  {a.status}
-                </span>
-              </div>
-              {a.status === "BOOKED" && (
-                <div className="flex items-center gap-3">
-                  <button
-                    onClick={() => startReschedule(a)}
-                    className="text-brand-600 text-sm font-medium hover:underline"
-                  >
-                    Reschedule
-                  </button>
-                  <button onClick={() => cancel(a.id)} className="text-red-600 text-sm hover:underline">
-                    Cancel
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {a.postVisitSummary && (
-              <div className="mt-4 bg-slate-50 rounded p-3 text-sm">
-                <p className="font-medium mb-1">Visit Summary</p>
-                <p className="text-slate-700">{a.postVisitSummary.summary}</p>
-                {a.postVisitSummary.medicationSchedule?.length > 0 && (
-                  <ul className="mt-2 list-disc list-inside text-slate-600">
-                    {a.postVisitSummary.medicationSchedule.map((m, i) => (
-                      <li key={i}>{m.drug} — {m.instructions}</li>
-                    ))}
-                  </ul>
-                )}
-              </div>
-            )}
-          </div>
-        ))}
-      </div>
+      {/* Mobile Bottom Navigation */}
+      <MobileBottomNav />
 
       {/* Reschedule Modal */}
       {reschedulingAppt && (
-        <div className="fixed inset-0 bg-black/40 flex items-center justify-center p-4 z-50">
-          <div className="bg-white rounded-xl max-w-md w-full p-6 shadow-xl space-y-4">
-            <h2 className="text-lg font-bold text-slate-800">
-              Reschedule Appointment with Dr. {reschedulingAppt.doctor.user.name}
-            </h2>
-            <p className="text-xs text-slate-500">
-              Current Time: {new Date(reschedulingAppt.slotStart).toLocaleString()}
-            </p>
+        <RescheduleModal
+          appointment={reschedulingAppt}
+          rescheduleDate={rescheduleDate}
+          onDateChange={(newDate) => {
+            setRescheduleDate(newDate);
+            fetchSlotsForDate(reschedulingAppt.doctorId, newDate);
+          }}
+          availableSlots={availableSlots}
+          selectedSlot={selectedSlot}
+          onSelectSlot={setSelectedSlot}
+          loadingSlots={loadingSlots}
+          rescheduleError={rescheduleError}
+          rescheduleSuccess={rescheduleSuccess}
+          rescheduling={rescheduling}
+          onConfirm={confirmReschedule}
+          onClose={() => setReschedulingAppt(null)}
+        />
+      )}
 
-            {rescheduleError && (
-              <div className="p-3 bg-red-50 text-red-700 rounded text-sm">
-                {rescheduleError}
-              </div>
-            )}
-
-            {rescheduleSuccess && (
-              <div className="p-3 bg-green-50 text-green-700 rounded text-sm font-medium">
-                {rescheduleSuccess}
-              </div>
-            )}
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-600 uppercase mb-1">
-                Select New Date
-              </label>
-              <input
-                type="date"
-                className="w-full border rounded px-3 py-2 text-sm"
-                value={rescheduleDate}
-                onChange={(e) => {
-                  setRescheduleDate(e.target.value);
-                  fetchSlotsForDate(reschedulingAppt.doctorId, e.target.value);
-                }}
-              />
-            </div>
-
-            <div>
-              <label className="block text-xs font-semibold text-slate-600 uppercase mb-1">
-                Select Available Slot
-              </label>
-              {loadingSlots && <p className="text-xs text-slate-400">Loading available slots...</p>}
-              {!loadingSlots && availableSlots.length === 0 && !rescheduleError && (
-                <p className="text-xs text-slate-400">No open slots on this date. Please pick another date.</p>
-              )}
-              <div className="grid grid-cols-3 gap-2 max-h-44 overflow-y-auto pt-1">
-                {availableSlots.map((slot) => {
-                  const slotDate = new Date(slot);
-                  const isSelected = selectedSlot === slot;
-                  return (
-                    <button
-                      key={slot}
-                      type="button"
-                      onClick={() => setSelectedSlot(slot)}
-                      className={`px-2 py-1.5 rounded text-xs font-medium border transition ${
-                        isSelected
-                          ? "bg-brand-600 text-white border-brand-600"
-                          : "bg-slate-50 hover:bg-slate-100 text-slate-700 border-slate-200"
-                      }`}
-                    >
-                      {slotDate.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-
-            <div className="flex justify-end gap-2 pt-2 border-t">
-              <button
-                type="button"
-                disabled={rescheduling}
-                onClick={() => setReschedulingAppt(null)}
-                className="px-4 py-2 text-sm text-slate-600 hover:bg-slate-100 rounded"
-              >
-                Cancel
-              </button>
-              <button
-                type="button"
-                disabled={rescheduling || !selectedSlot}
-                onClick={confirmReschedule}
-                className="px-4 py-2 text-sm bg-brand-600 hover:bg-brand-700 disabled:opacity-50 text-white font-medium rounded shadow"
-              >
-                {rescheduling ? "Rescheduling..." : "Confirm Reschedule"}
-              </button>
-            </div>
-          </div>
-        </div>
+      {/* Cancel Appointment Modal */}
+      {cancellingAppt && (
+        <CancelAppointmentModal
+          appointment={cancellingAppt}
+          cancelling={cancelling}
+          cancelError={cancelError}
+          onConfirmCancel={confirmCancel}
+          onClose={() => !cancelling && setCancellingAppt(null)}
+        />
       )}
     </div>
   );

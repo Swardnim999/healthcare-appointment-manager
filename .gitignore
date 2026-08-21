@@ -36,3 +36,6 @@ Thumbs.db
 *.temp
 # Antigravity metadata
 .agents/
+
+# Design references
+design-reference/

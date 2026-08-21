@@ -19,6 +19,8 @@ function Nav() {
   const user = getUser();
   const navigate = useNavigate();
   if (!user) return null;
+  // Patient routes use the specialized VITALIS Health header
+  if (user.role === "PATIENT") return null;
   return (
     <nav className="bg-brand-700 text-white px-6 py-3 flex justify-between items-center">
       <div className="font-semibold">🏥 Clinic Manager</div>
