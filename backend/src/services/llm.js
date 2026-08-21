@@ -4,6 +4,16 @@ const client = process.env.ANTHROPIC_API_KEY
   ? new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY })
   : null;
 
+let mockAnthropicClient = null;
+
+export function setAnthropicClientMock(mock) {
+  mockAnthropicClient = mock;
+}
+
+export function getAnthropicClientMock() {
+  return mockAnthropicClient;
+}
+
 const MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-20241022";
 
 export function normalizeUrgency(urgency) {
@@ -22,12 +32,13 @@ export function normalizeUrgency(urgency) {
  * fallback object and mark it so the UI/DB can flag "AI summary unavailable".
  */
 export async function callClaudeJSON(systemPrompt, userPrompt, fallback) {
-  if (!client) {
+  const activeClient = mockAnthropicClient || client;
+  if (!activeClient) {
     console.warn("[llm] ANTHROPIC_API_KEY not set — returning fallback summary");
     return { ...fallback, _aiFailed: true };
   }
   try {
-    const response = await client.messages.create({
+    const response = await activeClient.messages.create({
       model: MODEL,
       max_tokens: 500,
       system: systemPrompt,

@@ -2,8 +2,18 @@ import nodemailer from "nodemailer";
 import prisma from "../utils/db.js";
 
 let transporter = null;
+let mockTransporter = null;
+
+export function setEmailTransportMock(mock) {
+  mockTransporter = mock;
+}
+
+export function getEmailTransportMock() {
+  return mockTransporter;
+}
 
 export function getTransporter() {
+  if (mockTransporter) return mockTransporter;
   if (transporter) return transporter;
 
   if (process.env.SMTP_HOST && process.env.SMTP_USER) {
@@ -17,11 +27,6 @@ export function getTransporter() {
     // demoed/graded without needing real SMTP credentials.
     transporter = {
       sendMail: async (opts) => {
-        console.log("\n===== [DEV EMAIL] =====");
-        console.log("To:", opts.to);
-        console.log("Subject:", opts.subject);
-        console.log("Body:\n", opts.text);
-        console.log("========================\n");
         return { messageId: "dev-" + Date.now() };
       },
     };
