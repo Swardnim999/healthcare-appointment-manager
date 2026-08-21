@@ -5,6 +5,7 @@ import { requireAuth, requireRole } from "../middleware/auth.js";
 import { generatePreVisitSummary, generatePostVisitSummary, normalizeUrgency } from "../services/llm.js";
 import { sendEmail } from "../services/email.js";
 import { createCalendarEvent, updateCalendarEvent, deleteCalendarEvent } from "../services/calendar.js";
+import { isValidDoctorSlotTime } from "./doctors.js";
 
 const router = Router();
 const HOLD_TTL_MS = (Number(process.env.SLOT_HOLD_TTL_SECONDS) || 300) * 1000;
@@ -315,6 +316,168 @@ router.post("/:id/cancel", requireAuth, async (req, res) => {
   });
 
   res.json({ status: "CANCELLED" });
+});
+
+// Reschedule appointment
+router.post("/:id/reschedule", requireAuth, async (req, res) => {
+  const { id } = req.params;
+  const { newSlotStart, newDoctorId } = req.body;
+
+  if (!newSlotStart) {
+    return res.status(400).json({ error: "newSlotStart is required" });
+  }
+
+  const appt = await prisma.appointment.findUnique({
+    where: { id },
+    include: { doctor: { include: { user: true } }, patient: true },
+  });
+  if (!appt) return res.status(404).json({ error: "Appointment not found" });
+
+  // Authorization check
+  const isOwnerPatient = req.user.role === "PATIENT" && appt.patientId === req.user.id;
+  const doctorProfile = req.user.role === "DOCTOR" ? await prisma.doctorProfile.findUnique({ where: { userId: req.user.id } }) : null;
+  const isOwnerDoctor = doctorProfile && appt.doctorId === doctorProfile.id;
+  if (!isOwnerPatient && !isOwnerDoctor && req.user.role !== "ADMIN") {
+    return res.status(403).json({ error: "Not authorized to reschedule this appointment" });
+  }
+
+  // Reschedulable state check: only BOOKED appointments can be rescheduled
+  if (appt.status !== "BOOKED") {
+    return res.status(400).json({ error: `Appointment in '${appt.status}' status cannot be rescheduled` });
+  }
+
+  const targetDoctorId = newDoctorId || appt.doctorId;
+  const targetDoctor = targetDoctorId === appt.doctorId
+    ? appt.doctor
+    : await prisma.doctorProfile.findUnique({ where: { id: targetDoctorId }, include: { user: true } });
+  if (!targetDoctor) return res.status(404).json({ error: "Target doctor not found" });
+
+  const newStart = new Date(newSlotStart);
+  if (isNaN(newStart.getTime())) {
+    return res.status(400).json({ error: "Invalid newSlotStart date" });
+  }
+
+  // Validate that the slot matches doctor's working schedule and slot duration
+  if (!isValidDoctorSlotTime(targetDoctor, newStart)) {
+    return res.status(400).json({ error: "The selected time is not a valid appointment slot for this doctor" });
+  }
+
+  const newEnd = new Date(newStart.getTime() + targetDoctor.slotDurationMin * 60 * 1000);
+
+  // Check doctor leave on the new date
+  const isoDate = newStart.toISOString().slice(0, 10);
+  const localDate = `${newStart.getFullYear()}-${String(newStart.getMonth() + 1).padStart(2, "0")}-${String(newStart.getDate()).padStart(2, "0")}`;
+  const onLeave = await prisma.doctorLeave.findFirst({
+    where: {
+      doctorId: targetDoctorId,
+      OR: [{ date: isoDate }, { date: localDate }],
+    },
+  });
+  if (onLeave) {
+    return res.status(409).json({ error: "Doctor is on leave on the selected date" });
+  }
+
+  try {
+    const updated = await prisma.$transaction(async (tx) => {
+      // 1. Clean up stale records (expired holds, cancelled) at the target slot if any
+      const stale = await tx.appointment.findMany({
+        where: {
+          doctorId: targetDoctorId,
+          slotStart: newStart,
+          id: { not: appt.id },
+          OR: [
+            { status: "HELD", holdExpiresAt: { lt: new Date() } },
+            { status: { in: ["CANCELLED", "CANCELLED_BY_LEAVE"] } },
+          ],
+        },
+        select: { id: true },
+      });
+
+      if (stale.length > 0) {
+        const staleIds = stale.map((s) => s.id);
+        await tx.emailLog.updateMany({
+          where: { appointmentId: { in: staleIds } },
+          data: { appointmentId: null },
+        });
+        await tx.medicationReminder.deleteMany({
+          where: { appointmentId: { in: staleIds } },
+        });
+        await tx.appointment.deleteMany({
+          where: { id: { in: staleIds } },
+        });
+      }
+
+      // 2. Check for active conflicts at target slot
+      const conflicting = await tx.appointment.findFirst({
+        where: {
+          doctorId: targetDoctorId,
+          slotStart: newStart,
+          id: { not: appt.id },
+          OR: [
+            { status: { in: ["BOOKED", "COMPLETED"] } },
+            { status: "HELD", holdExpiresAt: { gt: new Date() } },
+          ],
+        },
+      });
+      if (conflicting) {
+        throw new Error("SLOT_CONFLICT");
+      }
+
+      // 3. Atomically update the appointment to the new slot
+      return tx.appointment.update({
+        where: { id: appt.id },
+        data: {
+          doctorId: targetDoctorId,
+          slotStart: newStart,
+          slotEnd: newEnd,
+        },
+      });
+    });
+
+    // Side-effects outside transaction: Google Calendar & Email failures must NOT roll back DB or return 500
+    try {
+      await updateCalendarEvent(appt.patientId, appt.patientCalendarEventId, {
+        summary: `Appointment with Dr. ${targetDoctor.user.name}`,
+        start: newStart,
+        end: newEnd,
+      });
+      await updateCalendarEvent(targetDoctor.userId, appt.doctorCalendarEventId, {
+        summary: `Patient: ${appt.patient.name}`,
+        start: newStart,
+        end: newEnd,
+      });
+    } catch (calErr) {
+      console.error("[reschedule] Google Calendar update failed (non-blocking):", calErr.message);
+    }
+
+    try {
+      const when = newStart.toLocaleString();
+      await sendEmail({
+        to: appt.patient.email,
+        subject: "Appointment Rescheduled",
+        text: `Your appointment with Dr. ${targetDoctor.user.name} has been rescheduled to ${when}.`,
+        type: "BOOKING_CONFIRMATION",
+        appointmentId: appt.id,
+      });
+      await sendEmail({
+        to: targetDoctor.user.email,
+        subject: "Appointment Rescheduled",
+        text: `Appointment with ${appt.patient.name} has been rescheduled to ${when}.`,
+        type: "BOOKING_CONFIRMATION",
+        appointmentId: appt.id,
+      });
+    } catch (emailErr) {
+      console.error("[reschedule] Reschedule email notification failed (non-blocking):", emailErr.message);
+    }
+
+    return res.json(updated);
+  } catch (err) {
+    if (err.message === "SLOT_CONFLICT" || (err instanceof Prisma.PrismaClientKnownRequestError && err.code === "P2002")) {
+      return res.status(409).json({ error: "The selected slot is already taken. Please choose another slot." });
+    }
+    console.error("[reschedule error]", err);
+    return res.status(500).json({ error: "Failed to reschedule appointment" });
+  }
 });
 
 function safeParse(json) {

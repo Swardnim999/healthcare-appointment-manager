@@ -15,6 +15,49 @@ router.get("/", async (req, res) => {
   res.json(doctors);
 });
 
+export function getDoctorScheduleSlots(doctor, dateStr) {
+  if (!doctor || !doctor.workingHours) return [];
+  const workingHours = typeof doctor.workingHours === "string" ? JSON.parse(doctor.workingHours) : doctor.workingHours;
+  const dayKey = new Date(dateStr + "T00:00:00").toLocaleDateString("en-US", { weekday: "short" }).toLowerCase().slice(0, 3);
+  const hours = workingHours[dayKey];
+  if (!hours || !hours[0] || !hours[1]) return [];
+
+  const [startH, startM] = hours[0].split(":").map(Number);
+  const [endH, endM] = hours[1].split(":").map(Number);
+  const slotMs = (doctor.slotDurationMin || 30) * 60 * 1000;
+
+  const dayStart = new Date(dateStr + "T00:00:00");
+  let cursor = new Date(dayStart);
+  cursor.setHours(startH, startM, 0, 0);
+  const end = new Date(dayStart);
+  end.setHours(endH, endM, 0, 0);
+
+  const allSlots = [];
+  while (cursor.getTime() + slotMs <= end.getTime()) {
+    allSlots.push(new Date(cursor));
+    cursor = new Date(cursor.getTime() + slotMs);
+  }
+  return allSlots;
+}
+
+export function isValidDoctorSlotTime(doctor, targetDate) {
+  const target = new Date(targetDate);
+  if (isNaN(target.getTime())) return false;
+
+  const isoDate = target.toISOString().slice(0, 10);
+  const localDate = `${target.getFullYear()}-${String(target.getMonth() + 1).padStart(2, "0")}-${String(target.getDate()).padStart(2, "0")}`;
+
+  const validSlotsIso = getDoctorScheduleSlots(doctor, isoDate);
+  const validSlotsLocal = getDoctorScheduleSlots(doctor, localDate);
+
+  const validTimestamps = new Set([
+    ...validSlotsIso.map((s) => s.getTime()),
+    ...validSlotsLocal.map((s) => s.getTime()),
+  ]);
+
+  return validTimestamps.has(target.getTime());
+}
+
 // Public: get available slots for a doctor on a given date (YYYY-MM-DD)
 router.get("/:doctorId/slots", async (req, res) => {
   const { doctorId } = req.params;
@@ -30,28 +73,10 @@ router.get("/:doctorId/slots", async (req, res) => {
   });
   if (onLeave) return res.json({ available: false, reason: "Doctor on leave", slots: [] });
 
-  const workingHours = JSON.parse(doctor.workingHours);
-  const dayKey = new Date(date + "T00:00:00").toLocaleDateString("en-US", { weekday: "short" }).toLowerCase().slice(0, 3);
-  const hours = workingHours[dayKey];
-  if (!hours) return res.json({ available: true, slots: [] });
-
-  const [startH, startM] = hours[0].split(":").map(Number);
-  const [endH, endM] = hours[1].split(":").map(Number);
-  const slotMs = doctor.slotDurationMin * 60 * 1000;
-
-  const dayStart = new Date(date + "T00:00:00");
-  let cursor = new Date(dayStart);
-  cursor.setHours(startH, startM, 0, 0);
-  const end = new Date(dayStart);
-  end.setHours(endH, endM, 0, 0);
-
-  const allSlots = [];
-  while (cursor.getTime() + slotMs <= end.getTime()) {
-    allSlots.push(new Date(cursor));
-    cursor = new Date(cursor.getTime() + slotMs);
-  }
+  const allSlots = getDoctorScheduleSlots(doctor, date);
 
   // Exclude slots that are BOOKED or currently HELD-and-not-expired
+  const dayStart = new Date(date + "T00:00:00");
   const dayEnd = new Date(dayStart);
   dayEnd.setHours(23, 59, 59, 999);
   const taken = await prisma.appointment.findMany({

@@ -3,7 +3,7 @@ import prisma from "../utils/db.js";
 
 let transporter = null;
 
-function getTransporter() {
+export function getTransporter() {
   if (transporter) return transporter;
 
   if (process.env.SMTP_HOST && process.env.SMTP_USER) {

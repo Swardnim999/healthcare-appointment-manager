@@ -8,11 +8,22 @@ export default function DoctorDashboard() {
   const [prescription, setPrescription] = useState([{ drug: "", dose: "", frequency: "once daily", days: 3 }]);
   const [error, setError] = useState("");
   const [submitting, setSubmitting] = useState(false);
+  const [calendarConnected, setCalendarConnected] = useState(false);
 
   function load() {
     api("/appointments/doctor/mine").then(setAppointments).catch((e) => setError(e.message));
+    api("/calendar/status").then((data) => setCalendarConnected(data.connected)).catch(() => setCalendarConnected(false));
   }
   useEffect(load, []);
+
+  async function connectCalendar() {
+    try {
+      const data = await api("/calendar/oauth/url");
+      if (data.url) window.location.href = data.url;
+    } catch (err) {
+      setError(err.message || "Failed to initiate Google Calendar connection");
+    }
+  }
 
   function updateMed(i, field, value) {
     const next = [...prescription];
@@ -46,7 +57,21 @@ export default function DoctorDashboard() {
 
   return (
     <div className="max-w-3xl mx-auto p-6">
-      <h1 className="text-2xl font-bold text-brand-700 mb-6">My Appointments</h1>
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-bold text-brand-700">Doctor Dashboard</h1>
+        {calendarConnected ? (
+          <span className="text-xs bg-green-100 text-green-700 px-2 py-1 rounded font-medium">
+            ✓ Google Calendar Connected
+          </span>
+        ) : (
+          <button
+            onClick={connectCalendar}
+            className="text-xs bg-slate-100 hover:bg-slate-200 text-slate-700 px-3 py-1.5 rounded font-medium border border-slate-300 transition"
+          >
+            📅 Connect Google Calendar
+          </button>
+        )}
+      </div>
       {error && <p className="text-red-600 mb-4">{error}</p>}
 
       <div className="space-y-4">

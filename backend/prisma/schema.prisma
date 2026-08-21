@@ -107,17 +107,26 @@ model MedicationReminder {
 }
 
 model EmailLog {
-  id            String   @id @default(uuid())
-  appointmentId String?
-  appointment   Appointment? @relation(fields: [appointmentId], references: [id])
-  toEmail       String
-  subject       String?
-  body          String?
-  type          String   // BOOKING_CONFIRMATION | REMINDER | CANCELLATION | LEAVE_CANCELLATION
-  status        String   // SENT | FAILED | RETRYING
-  attempts      Int      @default(0)
-  lastError     String?
-  createdAt     DateTime @default(now())
+  id             String   @id @default(uuid())
+  appointmentId  String?
+  appointment    Appointment? @relation(fields: [appointmentId], references: [id])
+  toEmail        String
+  subject        String?
+  body           String?
+  type           String   // BOOKING_CONFIRMATION | REMINDER | CANCELLATION | LEAVE_CANCELLATION | APPOINTMENT_REMINDER
+  status         String   // SENT | FAILED | RETRYING
+  attempts       Int      @default(0)
+  lastError      String?
+  idempotencyKey String?  @unique
+  createdAt      DateTime @default(now())
+}
+
+model OAuthState {
+  state     String   @id
+  userId    String
+  expiresAt DateTime
+  used      Boolean  @default(false)
+  createdAt DateTime @default(now())
 }
 
 model GoogleToken {
