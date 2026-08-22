@@ -7,7 +7,11 @@
     "start": "node src/index.js",
     "test": "node --test --test-concurrency=1 tests/**/*.test.js",
     "prisma:generate": "prisma generate",
-    "prisma:migrate": "prisma migrate dev --name init",
+    "prisma:migrate": "prisma migrate dev",
+    "prisma:migrate:dev": "prisma migrate dev",
+    "prisma:migrate:deploy": "prisma migrate deploy",
+    "prisma:migrate:status": "prisma migrate status",
+    "db:deploy": "prisma migrate deploy && prisma generate",
     "seed": "node prisma/seed.js"
   },
   "dependencies": {
